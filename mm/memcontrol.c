@@ -3973,6 +3973,26 @@ static int memcg_hotness_age_stats_read(struct seq_file *sf, void *v)
 
 	return 0;
 }
+
+static int memcg_hotness_access_freq_stats_read(struct seq_file *sf, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+	unsigned int seqcount;
+	struct page_access_freq_stats stats[NUM_PAGE_ACCESS_FREQ_BUCKETS];
+	int bucket;
+
+	do {
+		seqcount = read_seqcount_begin(&memcg->page_access_freq_stats_lock);
+		memcpy(stats, memcg->page_access_freq_stats_printed, sizeof(stats));
+	} while (read_seqcount_retry(&memcg->page_access_freq_stats_lock, seqcount));
+
+	seq_printf(sf, "%lu", memcg->num_scans);
+	for (bucket = 0; bucket < NUM_PAGE_ACCESS_FREQ_BUCKETS; bucket++)
+		seq_printf(sf, ",%lu", stats[bucket].num_pages * PAGE_SIZE);
+	seq_printf(sf, "\n");
+
+	return 0;
+}
 #endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 
 static struct cftype mem_cgroup_legacy_files[] = {
@@ -4107,6 +4127,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
 	{
 		.name = "hotness.age.stats",
 		.seq_show = memcg_hotness_age_stats_read,
+	},
+	{
+		.name = "hotness.access_freq.stats",
+		.seq_show = memcg_hotness_access_freq_stats_read,
 	},
 #endif
 	{ },	/* terminate */
@@ -4281,6 +4305,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	INIT_LIST_HEAD(&memcg->cgwb_list);
 #endif
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	seqcount_init(&memcg->page_access_freq_stats_lock);
 	seqcount_init(&memcg->page_age_stats_lock);
 #endif
 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
@@ -6304,7 +6329,8 @@ subsys_initcall(mem_cgroup_swap_init);
 
 enum hotness_metric {
 	NONE = 0,
-	PAGE_AGE
+	PAGE_AGE,
+	PAGE_ACCESS_FREQ
 };
 
 static DECLARE_WAIT_QUEUE_HEAD(profd_wait);
@@ -6390,6 +6416,57 @@ fail_page_idle_get_page:
 	return nr_pages;
 }
 
+// access frequency profiling
+static inline struct page_access_freq_stats *
+get_page_access_freq_stats(struct mem_cgroup *memcg, int access_freq)
+{
+	int bucket = 0;
+
+	while (access_freq >= page_access_freq_buckets[bucket + 1])
+		if (++bucket == NUM_PAGE_ACCESS_FREQ_BUCKETS - 1)
+			break;
+
+	return memcg->page_access_freq_stats + bucket;
+}
+
+static unsigned int scan_page_access_freq(pg_data_t *pgdat, unsigned long pfn)
+{
+	struct page *page;
+	unsigned int nr_pages = 1;
+	struct mem_cgroup *memcg;
+	struct page_access_freq_stats *freq_stats;
+
+	page = page_idle_get_page(pfn);
+	if (page == NULL)
+		goto fail_page_idle_get_page;
+	nr_pages = PageHuge(page) || PageTransHuge(page) ? HPAGE_PMD_NR : 1;
+
+	memcg = page->mem_cgroup;
+	if (!memcg)
+		goto fail_get_memcg;
+
+	memcg->num_scanned_bytes +=
+		PageHuge(page) || PageTransHuge(page) ? PMD_PAGE_SIZE : PAGE_SIZE;
+	bitmap_shift_right(page->freq_bitmap, page->freq_bitmap, 1, FREQ_BITMAP_SIZE);
+	page_idle_clear_pte_refs(page);
+	if (page_is_idle(page)) {
+		bitmap_clear(page->freq_bitmap, FREQ_BITMAP_SIZE-1, 1);
+	} else {
+		bitmap_set(page->freq_bitmap, FREQ_BITMAP_SIZE-1, 1);
+		set_page_idle(page);
+	}
+
+	page->access_freq = bitmap_weight(page->freq_bitmap, FREQ_BITMAP_SIZE);
+	freq_stats = get_page_access_freq_stats(memcg, page->access_freq);
+	freq_stats->num_pages += nr_pages;
+
+fail_get_memcg:
+	put_page(page);
+
+fail_page_idle_get_page:
+	return nr_pages;
+}
+
 static void collect_stats_age(struct mem_cgroup *memcg)
 {
 	int i;
@@ -6406,6 +6483,24 @@ static void collect_stats_age(struct mem_cgroup *memcg)
 	}
 	memset(&memcg->page_age_stats, 0, sizeof(memcg->page_age_stats));
 	write_seqcount_end(&memcg->page_age_stats_lock);
+}
+
+static void collect_stats_access_freq(struct mem_cgroup *memcg)
+{
+	int i;
+
+	memcg->num_scans++;
+	memcg->num_scanned_bytes_printed = memcg->num_scanned_bytes;
+	memcg->num_scanned_bytes = 0;
+
+	write_seqcount_begin(&memcg->page_access_freq_stats_lock);
+	for (i = NUM_PAGE_ACCESS_FREQ_BUCKETS - 1; i >= 0; i--) {
+		struct page_access_freq_stats *page_access_freq_bucket;
+		page_access_freq_bucket = memcg->page_access_freq_stats + i;
+		memcg->page_access_freq_stats_printed[i].num_pages = page_access_freq_bucket->num_pages;
+	}
+	memset(&memcg->page_access_freq_stats, 0, sizeof(memcg->page_access_freq_stats));
+	write_seqcount_end(&memcg->page_access_freq_stats_lock);
 }
 
 static void scan_pages(pg_data_t *pgdat,
@@ -6504,6 +6599,10 @@ static ssize_t hotness_metric_show(struct kobject *kobj,
 			pos = sprintf(buf, "PAGE_AGE\n");
 			break;
 
+		case PAGE_ACCESS_FREQ:
+			pos = sprintf(buf, "PAGE_ACCESS_FREQ\n");
+			break;
+
 		default:
 			break;
 	}
@@ -6527,6 +6626,11 @@ static ssize_t hotness_metric_store(struct kobject *kobj,
 		case PAGE_AGE:
 			scan_page = scan_page_age;
 			collect_stats = collect_stats_age;
+			break;
+
+		case PAGE_ACCESS_FREQ:
+			scan_page = scan_page_access_freq;
+			collect_stats = collect_stats_access_freq;
 			break;
 
 		default:

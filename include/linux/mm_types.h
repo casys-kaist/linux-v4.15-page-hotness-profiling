@@ -212,6 +212,12 @@ struct page {
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
+
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+#define FREQ_BITMAP_SIZE 8
+	DECLARE_BITMAP(freq_bitmap, FREQ_BITMAP_SIZE);
+	int access_freq;
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 }
 /*
  * The struct page can be forced to be double word aligned so that atomic ops

@@ -1070,6 +1070,11 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	kernel_map_pages(page, 1 << order, 0);
 	kasan_free_pages(page, order);
 
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	bitmap_clear(page->freq_bitmap, 0, FREQ_BITMAP_SIZE);
+	page->access_freq = 0;
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
+
 	return true;
 }
 
@@ -1818,6 +1823,11 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 		set_page_pfmemalloc(page);
 	else
 		clear_page_pfmemalloc(page);
+
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	bitmap_clear(page->freq_bitmap, 0, FREQ_BITMAP_SIZE);
+	page->access_freq = 0;
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 }
 
 /*

@@ -158,6 +158,11 @@ enum memcg_kmem_state {
 	KMEM_ONLINE,
 };
 
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static const int page_access_freq_buckets[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+#define NUM_PAGE_ACCESS_FREQ_BUCKETS ARRAY_SIZE(page_access_freq_buckets)
+#endif
+
 /*
  * The memory controller data structure. The memory controller controls both
  * page cache and RSS per cgroup. We would eventually like to provide
@@ -278,6 +283,13 @@ struct mem_cgroup {
 		unsigned long num_pages;
 	} page_age_stats[NUM_PAGE_AGE_BUCKETS],
 	page_age_stats_printed[NUM_PAGE_AGE_BUCKETS];
+
+	// access frequency
+	seqcount_t page_access_freq_stats_lock;
+	struct page_access_freq_stats {
+		unsigned long num_pages;
+	} page_access_freq_stats[NUM_PAGE_ACCESS_FREQ_BUCKETS],
+	page_access_freq_stats_printed[NUM_PAGE_ACCESS_FREQ_BUCKETS];
 #endif
 
 	struct mem_cgroup_per_node *nodeinfo[0];
