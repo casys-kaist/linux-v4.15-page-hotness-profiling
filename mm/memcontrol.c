@@ -6269,6 +6269,8 @@ static int __init mem_cgroup_swap_init(void)
 subsys_initcall(mem_cgroup_swap_init);
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static unsigned int scanning_interval;
+
 static int profd(void *dummy)
 {
 	while (!kthread_should_stop())
@@ -6277,10 +6279,58 @@ static int profd(void *dummy)
 	return 0;
 }
 
+static ssize_t scanning_interval_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%u\n", scanning_interval);
+}
+
+static ssize_t scanning_interval_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int ret;
+	unsigned long input;
+
+	ret = kstrtoul(buf, 10, &input);
+	if (ret)
+		return -EINVAL;
+	scanning_interval = input;
+
+	return count;
+}
+
+static struct kobj_attribute scanning_interval_attr
+= __ATTR(scanning_interval, 0644,
+		scanning_interval_show,
+		scanning_interval_store);
+
+static struct attribute *profd_attrs[] = {
+	&scanning_interval_attr.attr,
+	NULL
+};
+
+static struct attribute_group profd_attr_group = {
+	.attrs = profd_attrs,
+};
+
 static int __init profd_init(void)
 {
 	int ret = 0;
+	struct kobject *profd_kobj;
 	struct task_struct *thread;
+
+	profd_kobj = kobject_create_and_add("profd", mm_kobj);
+	if (unlikely(!profd_kobj)) {
+		pr_err("kobjject_create_and_add failed\n");
+		ret = -ENOMEM;
+		goto fail_kobject_create_and_add;
+	}
+
+	ret = sysfs_create_group(profd_kobj, &profd_attr_group);
+	if (ret) {
+		pr_err("sysfs_create_group failed\n");
+		goto fail_sysfs_create_group;
+	}
 
 	thread = kthread_run(profd, NULL, "profd");
 	if (IS_ERR(thread)) {
@@ -6292,6 +6342,10 @@ static int __init profd_init(void)
 	return ret;
 
 fail_kthread_run:
+	sysfs_remove_group(profd_kobj, &profd_attr_group);
+fail_sysfs_create_group:
+	kobject_put(profd_kobj);
+fail_kobject_create_and_add:
 	return ret;
 }
 module_init(profd_init);
