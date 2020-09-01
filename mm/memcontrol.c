@@ -6269,9 +6269,30 @@ static int __init mem_cgroup_swap_init(void)
 subsys_initcall(mem_cgroup_swap_init);
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static int profd(void *dummy)
+{
+	while (!kthread_should_stop())
+		udelay(1000);
+	BUG(); /* NOT REACHED  */
+	return 0;
+}
+
 static int __init profd_init(void)
 {
-	return 0;
+	int ret = 0;
+	struct task_struct *thread;
+
+	thread = kthread_run(profd, NULL, "profd");
+	if (IS_ERR(thread)) {
+		pr_err("kthread_run failed\n");
+		ret = PTR_ERR(thread);
+		goto fail_kthread_run;
+	}
+
+	return ret;
+
+fail_kthread_run:
+	return ret;
 }
 module_init(profd_init);
 #endif /* CONFIG_PAGE_HOTNESS_PROFILING */
