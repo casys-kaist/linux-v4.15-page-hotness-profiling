@@ -6269,12 +6269,32 @@ static int __init mem_cgroup_swap_init(void)
 subsys_initcall(mem_cgroup_swap_init);
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static DECLARE_WAIT_QUEUE_HEAD(profd_wait);
 static unsigned int scanning_interval;
 
 static int profd(void *dummy)
 {
-	while (!kthread_should_stop())
-		udelay(1000);
+	int _scanning_interval;
+	long deadline = jiffies;
+	long delta;
+
+	while (1) {
+		_scanning_interval = scanning_interval;
+		deadline += _scanning_interval * HZ;
+		if (_scanning_interval <= 0) {
+			wait_event_interruptible(profd_wait,
+					(_scanning_interval = scanning_interval) > 0);
+			deadline = jiffies + _scanning_interval * HZ;
+		}
+
+		delta = jiffies - deadline;
+		if (delta < 0)
+			schedule_timeout_interruptible(-delta);
+		else if (delta >= HZ)
+			pr_warn("profd running %ld.%02d seconds late",
+					delta / HZ, (int)(delta % HZ) * 100 / HZ);
+	}
+
 	BUG(); /* NOT REACHED  */
 	return 0;
 }
@@ -6295,6 +6315,7 @@ static ssize_t scanning_interval_store(struct kobject *kobj,
 	if (ret)
 		return -EINVAL;
 	scanning_interval = input;
+	wake_up_interruptible(&profd_wait);
 
 	return count;
 }
