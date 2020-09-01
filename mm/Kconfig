@@ -765,3 +765,8 @@ config GUP_BENCHMARK
 	  performance of get_user_pages_fast().
 
 	  See tools/testing/selftests/vm/gup_benchmark.c
+
+config PAGE_HOTNESS_PROFILING
+	bool "Tracking the hotness of pages with periodic scanning"
+	depends on MEMCG
+	default y
