@@ -800,6 +800,12 @@ static void __meminit resize_pgdat_range(struct pglist_data *pgdat, unsigned lon
 		pgdat->node_start_pfn = start_pfn;
 
 	pgdat->node_spanned_pages = max(start_pfn + nr_pages, old_end_pfn) - pgdat->node_start_pfn;
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	if (pgdat->node_page_age) {
+		vfree(pgdat->node_page_age);
+		pgdat->node_page_age = NULL;
+	}
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 }
 
 void __ref move_pfn_range_to_zone(struct zone *zone,

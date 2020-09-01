@@ -3953,6 +3953,28 @@ out_kfree:
 	return ret;
 }
 
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static int memcg_hotness_age_stats_read(struct seq_file *sf, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+	unsigned int seqcount;
+	struct page_age_stats stats[NUM_PAGE_AGE_BUCKETS];
+	int bucket;
+
+	do {
+		seqcount = read_seqcount_begin(&memcg->page_age_stats_lock);
+		memcpy(stats, memcg->page_age_stats_printed, sizeof(stats));
+	} while (read_seqcount_retry(&memcg->page_age_stats_lock, seqcount));
+
+	seq_printf(sf, "%lu", memcg->num_scans);
+	for (bucket = 0; bucket < NUM_PAGE_AGE_BUCKETS; bucket++)
+		seq_printf(sf, ",%lu", stats[bucket].num_pages * PAGE_SIZE);
+	seq_printf(sf, "\n");
+
+	return 0;
+}
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
+
 static struct cftype mem_cgroup_legacy_files[] = {
 	{
 		.name = "usage_in_bytes",
@@ -4081,6 +4103,12 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.write = mem_cgroup_reset,
 		.read_u64 = mem_cgroup_read_u64,
 	},
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	{
+		.name = "hotness.age.stats",
+		.seq_show = memcg_hotness_age_stats_read,
+	},
+#endif
 	{ },	/* terminate */
 };
 
@@ -4251,6 +4279,9 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 #endif
 #ifdef CONFIG_CGROUP_WRITEBACK
 	INIT_LIST_HEAD(&memcg->cgwb_list);
+#endif
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	seqcount_init(&memcg->page_age_stats_lock);
 #endif
 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
 	return memcg;
@@ -6272,7 +6303,8 @@ subsys_initcall(mem_cgroup_swap_init);
 #include <linux/page_idle.h>
 
 enum hotness_metric {
-	NONE = 0
+	NONE = 0,
+	PAGE_AGE
 };
 
 static DECLARE_WAIT_QUEUE_HEAD(profd_wait);
@@ -6305,6 +6337,75 @@ fail_page_idle_get_page:
 static void collect_stats_none(struct mem_cgroup *memcg)
 {
 	return;
+}
+
+// age profiling
+static inline struct page_age_stats *
+get_page_age_stats(struct mem_cgroup *memcg, int age)
+{
+	int bucket = 0;
+
+	while (age >= page_age_buckets[bucket + 1])
+		if (++bucket == NUM_PAGE_AGE_BUCKETS - 1)
+			break;
+
+	return memcg->page_age_stats + bucket;
+}
+
+static unsigned int scan_page_age(pg_data_t *pgdat, unsigned long pfn)
+{
+	struct page *page;
+	unsigned int nr_pages = 1;
+	struct mem_cgroup *memcg;
+	u8 *page_age;
+
+	page = page_idle_get_page(pfn);
+	if (page == NULL)
+		goto fail_page_idle_get_page;
+	nr_pages = PageHuge(page) || PageTransHuge(page) ? HPAGE_PMD_NR : 1;
+
+	memcg = page->mem_cgroup;
+	if (!memcg)
+		goto fail_get_memcg;
+
+	memcg->num_scanned_bytes +=
+		PageHuge(page) || PageTransHuge(page) ? PMD_PAGE_SIZE : PAGE_SIZE;
+	page_age = (pgdat->node_page_age - pgdat->node_start_pfn) + pfn;
+	page_idle_clear_pte_refs(page);
+	if (page_is_idle(page)) {
+		struct page_age_stats *age_stats;
+		if (*page_age < U8_MAX)
+			(*page_age)++;
+		age_stats = get_page_age_stats(memcg, *page_age);
+		age_stats->num_pages += nr_pages;
+	} else {
+		*page_age = 0;
+		set_page_idle(page);
+	}
+
+fail_get_memcg:
+	put_page(page);
+
+fail_page_idle_get_page:
+	return nr_pages;
+}
+
+static void collect_stats_age(struct mem_cgroup *memcg)
+{
+	int i;
+
+	memcg->num_scans++;
+	memcg->num_scanned_bytes_printed = memcg->num_scanned_bytes;
+	memcg->num_scanned_bytes = 0;
+
+	write_seqcount_begin(&memcg->page_age_stats_lock);
+	for (i = NUM_PAGE_AGE_BUCKETS - 1; i >= 0; i--) {
+		struct page_age_stats *page_age_bucket;
+		page_age_bucket = memcg->page_age_stats + i;
+		memcg->page_age_stats_printed[i].num_pages = page_age_bucket->num_pages;
+	}
+	memset(&memcg->page_age_stats, 0, sizeof(memcg->page_age_stats));
+	write_seqcount_end(&memcg->page_age_stats_lock);
 }
 
 static void scan_pages(pg_data_t *pgdat,
@@ -6388,13 +6489,88 @@ static ssize_t scanning_interval_store(struct kobject *kobj,
 	return count;
 }
 
+static ssize_t hotness_metric_show(struct kobject *kobj,
+		struct kobj_attribute *attr,
+		char *buf)
+{
+	ssize_t pos = 0;
+
+	switch (hotness_metric) {
+		case NONE:
+			pos = sprintf(buf, "NONE\n");
+			break;
+
+		case PAGE_AGE:
+			pos = sprintf(buf, "PAGE_AGE\n");
+			break;
+
+		default:
+			break;
+	}
+
+	return pos;
+}
+
+static ssize_t hotness_metric_store(struct kobject *kobj,
+		struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	int err;
+	unsigned long input;
+
+	err = kstrtoul(buf, 10, &input);
+	if (err)
+		return -EINVAL;
+	hotness_metric = input;
+
+	switch (hotness_metric) {
+		case PAGE_AGE:
+			scan_page = scan_page_age;
+			collect_stats = collect_stats_age;
+			break;
+
+		default:
+			hotness_metric = NONE;
+			scan_page = scan_page_none;
+			collect_stats = collect_stats_none;
+			return -EINVAL;
+	}
+
+	return count;
+}
+
+static ssize_t age_reset_store(struct kobject *kobj,
+		struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	int nid;
+	pg_data_t *pgdat;
+	for_each_node_state(nid, N_HIGH_MEMORY) {
+		pgdat = NODE_DATA(nid);
+		if (!pgdat->node_page_age)
+			continue;
+		memset(pgdat->node_page_age, 0, pgdat->node_spanned_pages);
+	}
+	return count;
+}
+
 static struct kobj_attribute scanning_interval_attr
 = __ATTR(scanning_interval, 0644,
 		scanning_interval_show,
 		scanning_interval_store);
+static struct kobj_attribute hotness_metric_attr
+= __ATTR(hotness_metric, 0644,
+		hotness_metric_show,
+		hotness_metric_store);
+static struct kobj_attribute age_reset_attr
+= __ATTR(age.reset, 0644,
+		NULL,
+		age_reset_store);
 
 static struct attribute *profd_attrs[] = {
 	&scanning_interval_attr.attr,
+	&hotness_metric_attr.attr,
+	&age_reset_attr.attr,
 	NULL
 };
 
@@ -6402,11 +6578,32 @@ static struct attribute_group profd_attr_group = {
 	.attrs = profd_attrs,
 };
 
+static bool alloc_page_age(pg_data_t *pgdat)
+{
+	if (!pgdat->node_page_age) {
+		pgdat->node_page_age = vmalloc(pgdat->node_spanned_pages);
+		if (!pgdat->node_page_age)
+			return false;
+		memset(pgdat->node_page_age, 0, pgdat->node_spanned_pages);
+	}
+
+	return true;
+}
+
 static int __init profd_init(void)
 {
 	int ret = 0;
+	int nid;
 	struct kobject *profd_kobj;
 	struct task_struct *thread;
+
+	for_each_node_state(nid, N_HIGH_MEMORY) {
+		if (!alloc_page_age(NODE_DATA(nid))) {
+			pr_err("failed to allocate memory for page age\n");
+			ret = -ENOMEM;
+			goto page_age_alloc_fail;
+		}
+	}
 
 	profd_kobj = kobject_create_and_add("profd", mm_kobj);
 	if (unlikely(!profd_kobj)) {
@@ -6435,6 +6632,7 @@ fail_kthread_run:
 fail_sysfs_create_group:
 	kobject_put(profd_kobj);
 fail_kobject_create_and_add:
+page_age_alloc_fail:
 	return ret;
 }
 module_init(profd_init);

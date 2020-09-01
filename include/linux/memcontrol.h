@@ -73,6 +73,11 @@ struct mem_cgroup_id {
 	atomic_t ref;
 };
 
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static const int page_age_buckets[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 240};
+#define NUM_PAGE_AGE_BUCKETS ARRAY_SIZE(page_age_buckets)
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
+
 /*
  * Per memcg event counter is incremented at every pagein/pageout. With THP,
  * it will be incremated by the number of pages. This counter is used for
@@ -260,6 +265,20 @@ struct mem_cgroup {
 	/* List of events which userspace want to receive */
 	struct list_head event_list;
 	spinlock_t event_list_lock;
+
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	// common
+	unsigned long num_scans;
+	unsigned long num_scanned_bytes;
+	unsigned long num_scanned_bytes_printed;
+
+	// page age
+	seqcount_t page_age_stats_lock;
+	struct page_age_stats {
+		unsigned long num_pages;
+	} page_age_stats[NUM_PAGE_AGE_BUCKETS],
+	page_age_stats_printed[NUM_PAGE_AGE_BUCKETS];
+#endif
 
 	struct mem_cgroup_per_node *nodeinfo[0];
 	/* WARNING: nodeinfo must be the last member here */
