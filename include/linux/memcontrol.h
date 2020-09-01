@@ -272,6 +272,8 @@ struct mem_cgroup {
 	spinlock_t event_list_lock;
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	int is_profiling_paused;
+
 	// common
 	unsigned long num_scans;
 	unsigned long num_scanned_bytes;

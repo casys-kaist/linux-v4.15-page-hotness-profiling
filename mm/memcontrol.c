@@ -3954,6 +3954,21 @@ out_kfree:
 }
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static u64 memcg_is_profiling_paused_read(struct cgroup_subsys_state *css,
+		struct cftype *cft)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	return memcg->is_profiling_paused;
+}
+
+static int memcg_is_profiling_paused_write(struct cgroup_subsys_state *css,
+		struct cftype *cft, u64 val)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+	memcg->is_profiling_paused = val;
+	return 0;
+}
+
 static int memcg_hotness_age_stats_read(struct seq_file *sf, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
@@ -4124,6 +4139,11 @@ static struct cftype mem_cgroup_legacy_files[] = {
 		.read_u64 = mem_cgroup_read_u64,
 	},
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+	{
+		.name = "is_profiling_paused",
+		.read_u64 = memcg_is_profiling_paused_read,
+		.write_u64 = memcg_is_profiling_paused_write,
+	},
 	{
 		.name = "hotness.age.stats",
 		.seq_show = memcg_hotness_age_stats_read,
@@ -6394,6 +6414,9 @@ static unsigned int scan_page_age(pg_data_t *pgdat, unsigned long pfn)
 	if (!memcg)
 		goto fail_get_memcg;
 
+	if (memcg->is_profiling_paused)
+		goto fail_get_memcg;
+
 	memcg->num_scanned_bytes +=
 		PageHuge(page) || PageTransHuge(page) ? PMD_PAGE_SIZE : PAGE_SIZE;
 	page_age = (pgdat->node_page_age - pgdat->node_start_pfn) + pfn;
@@ -6443,6 +6466,9 @@ static unsigned int scan_page_access_freq(pg_data_t *pgdat, unsigned long pfn)
 
 	memcg = page->mem_cgroup;
 	if (!memcg)
+		goto fail_get_memcg;
+
+	if (memcg->is_profiling_paused)
 		goto fail_get_memcg;
 
 	memcg->num_scanned_bytes +=
