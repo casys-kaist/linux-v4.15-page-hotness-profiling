@@ -6268,4 +6268,12 @@ static int __init mem_cgroup_swap_init(void)
 }
 subsys_initcall(mem_cgroup_swap_init);
 
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+static int __init profd_init(void)
+{
+	return 0;
+}
+module_init(profd_init);
+#endif /* CONFIG_PAGE_HOTNESS_PROFILING */
+
 #endif /* CONFIG_MEMCG_SWAP */
