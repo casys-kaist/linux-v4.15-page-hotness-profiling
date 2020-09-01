@@ -6269,14 +6269,67 @@ static int __init mem_cgroup_swap_init(void)
 subsys_initcall(mem_cgroup_swap_init);
 
 #ifdef CONFIG_PAGE_HOTNESS_PROFILING
+#include <linux/page_idle.h>
+
+enum hotness_metric {
+	NONE = 0
+};
+
 static DECLARE_WAIT_QUEUE_HEAD(profd_wait);
+static unsigned int hotness_metric = NONE;
 static unsigned int scanning_interval;
+
+static unsigned int scan_page_none(pg_data_t *pgdat, unsigned long pfn);
+static void collect_stats_none(struct mem_cgroup *memcg);
+
+unsigned int (*scan_page) (pg_data_t *pgdat, unsigned long pfn)
+	= scan_page_none;
+void (*collect_stats) (struct mem_cgroup *memcg)
+	= collect_stats_none;
+
+// dummy profiling
+static unsigned int scan_page_none(pg_data_t *pgdat, unsigned long pfn)
+{
+	struct page *page;
+	unsigned int nr_pages = 1;
+
+	page = page_idle_get_page(pfn);
+	if (page == NULL)
+		goto fail_page_idle_get_page;
+	nr_pages = PageHuge(page) || PageTransHuge(page) ? HPAGE_PMD_NR : 1;
+
+fail_page_idle_get_page:
+	return nr_pages;
+}
+
+static void collect_stats_none(struct mem_cgroup *memcg)
+{
+	return;
+}
+
+static void scan_pages(pg_data_t *pgdat,
+		unsigned int (*__scan_page) (pg_data_t *pgdat, unsigned long pfn))
+{
+	unsigned long flags;
+	unsigned long pfn, node_end;
+
+	pgdat_resize_lock(pgdat, &flags);
+
+	pfn = pgdat->node_start_pfn;
+	node_end = pfn + pgdat->node_spanned_pages;
+	while (pfn < node_end)
+		pfn += pfn_valid(pfn) ? __scan_page(pgdat, pfn) : 1;
+
+	pgdat_resize_unlock(pgdat, &flags);
+}
 
 static int profd(void *dummy)
 {
 	int _scanning_interval;
 	long deadline = jiffies;
 	long delta;
+	int nid;
+	struct mem_cgroup *memcg;
 
 	while (1) {
 		_scanning_interval = scanning_interval;
@@ -6286,6 +6339,21 @@ static int profd(void *dummy)
 					(_scanning_interval = scanning_interval) > 0);
 			deadline = jiffies + _scanning_interval * HZ;
 		}
+
+		/*
+		 * We use interruptible wait_event so as not to contribute
+		 * to the machine load average while we're sleeping.
+		 * However, we don't actually expect to receive a signal
+		 * since we run as a kernel thread, so the condition we were
+		 * waiting for should be true once we get here.
+		 */
+		BUG_ON(_scanning_interval <= 0);
+
+		for_each_node_state(nid, N_HIGH_MEMORY)
+			scan_pages(NODE_DATA(nid), scan_page);
+
+		for_each_mem_cgroup(memcg)
+			collect_stats(memcg);
 
 		delta = jiffies - deadline;
 		if (delta < 0)
