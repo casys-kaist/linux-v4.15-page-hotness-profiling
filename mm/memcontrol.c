@@ -65,6 +65,9 @@
 #include <linux/lockdep.h>
 #include <linux/file.h>
 #include <linux/tracehook.h>
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+#include <linux/nmi.h>
+#endif
 #include "internal.h"
 #include <net/sock.h>
 #include <net/ip.h>
@@ -73,6 +76,21 @@
 #include <linux/uaccess.h>
 
 #include <trace/events/vmscan.h>
+
+#ifdef CONFIG_PAGE_HOTNESS_PROFILING
+struct access_freq_variance_scratchpad {
+	// variance of access frequencies within a 2MB huge page
+	unsigned long long num_elems;
+	unsigned long long sum_of_squares;
+	unsigned long long sum;
+	unsigned long long avg;
+	unsigned long long var;
+
+	// list of observed variances
+	unsigned long long var_arr_idx;
+	unsigned long long var_arr[600000];
+};
+#endif
 
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
 EXPORT_SYMBOL(memory_cgrp_subsys);
@@ -4008,6 +4026,110 @@ static int memcg_hotness_access_freq_stats_read(struct seq_file *sf, void *v)
 
 	return 0;
 }
+
+static int calc_access_freq_variance_pmd_range(pmd_t *pmd,
+		unsigned long addr, unsigned long end,
+		struct mm_walk *walk)
+{
+	unsigned long pfn;
+	struct page *page;
+	struct access_freq_variance_scratchpad *sp = walk->private;
+
+	if (pmd_trans_huge(*pmd)) {
+		// ignore huge pages in calculating hotness variance
+	} else {
+		pte_t *pte = pte_offset_map(pmd, addr);
+		unsigned long _addr = addr;
+
+		while (1) {
+			pfn = (pte_val(*pte) & PTE_PFN_MASK) >> PAGE_SHIFT;
+			page = pfn_to_page(pfn);
+
+			if (!(_addr & (HPAGE_PMD_SIZE-1))) {
+				sp->num_elems = 0;
+				sp->sum_of_squares = 0;
+				sp->sum = 0;
+				sp->avg = 0;
+				sp->var = 0;
+			}
+
+			sp->num_elems++;
+			sp->sum_of_squares += (page->access_freq)*(page->access_freq);
+			sp->sum += page->access_freq;
+
+			if (sp->num_elems == HPAGE_PMD_NR) {
+				sp->avg = sp->sum / sp->num_elems;
+				sp->var = ((sp->sum_of_squares / sp->num_elems) - ((sp->avg)*(sp->avg)));
+
+				sp->var_arr[sp->var_arr_idx++] = sp->var;
+
+				sp->num_elems = 0;
+				sp->sum_of_squares = 0;
+				sp->sum = 0;
+				sp->avg = 0;
+				sp->var = 0;
+			}
+
+			_addr += PAGE_SIZE;
+			if (_addr == end)
+				break;
+			pte++;
+			touch_nmi_watchdog();
+		}
+	}
+
+	return 0;
+}
+
+static int calc_access_freq_variance(struct task_struct *task, void *arg)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		goto out;
+	down_read(&mm->mmap_sem);
+
+	vma = mm->mmap;
+	for (; vma != NULL; vma = vma->vm_next) {
+		struct mm_walk walk = {
+			.pmd_entry = calc_access_freq_variance_pmd_range,
+			.mm = mm,
+			.vma = vma,
+			.private = arg
+		};
+		walk_page_vma(vma, &walk);
+	}
+
+	up_read(&mm->mmap_sem);
+	mmput(mm);
+out:
+	return 0;
+}
+
+static int memcg_hotness_access_freq_variance_read(struct seq_file *sf, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+	struct access_freq_variance_scratchpad *sp;
+	unsigned int i;
+
+	sp = vmalloc(sizeof(struct access_freq_variance_scratchpad));
+	memset(sp, 0, sizeof(struct access_freq_variance_scratchpad));
+	mem_cgroup_scan_tasks(memcg, calc_access_freq_variance, sp);
+
+	for (i = 0; i < sp->var_arr_idx; i++) {
+		if (i == 0)
+			seq_printf(sf, "%llu", sp->var_arr[i]);
+		else
+			seq_printf(sf, ",%llu", sp->var_arr[i]);
+	}
+	seq_printf(sf, "\n");
+
+	vfree(sp);
+
+	return 0;
+}
 #endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 
 static struct cftype mem_cgroup_legacy_files[] = {
@@ -4151,6 +4273,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
 	{
 		.name = "hotness.access_freq.stats",
 		.seq_show = memcg_hotness_access_freq_stats_read,
+	},
+	{
+		.name = "hotness.access_freq.variance",
+		.seq_show = memcg_hotness_access_freq_variance_read,
 	},
 #endif
 	{ },	/* terminate */
