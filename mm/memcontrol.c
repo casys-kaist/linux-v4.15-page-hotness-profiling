@@ -90,6 +90,13 @@ struct access_freq_variance_scratchpad {
 	unsigned long long var_arr_idx;
 	unsigned long long var_arr[600000];
 };
+
+struct access_freq_accessed_base_page_scratchpad {
+	unsigned long long num_seen_base_pages;
+	unsigned long long num_accessed_base_pages;
+	unsigned long long num_accessed_base_pages_arr_idx;
+	unsigned long long num_accessed_base_pages_arr[600000];
+};
 #endif
 
 struct cgroup_subsys memory_cgrp_subsys __read_mostly;
@@ -4130,6 +4137,101 @@ static int memcg_hotness_access_freq_variance_read(struct seq_file *sf, void *v)
 
 	return 0;
 }
+
+static int count_accessed_base_pages_pmd_range(pmd_t *pmd,
+		unsigned long addr, unsigned long end,
+		struct mm_walk *walk)
+{
+	unsigned long pfn;
+	struct page *page;
+	struct access_freq_accessed_base_page_scratchpad *sp = walk->private;
+
+	if (pmd_trans_huge(*pmd)) {
+		// ignore huge pages in calculating hotness accessed_base_page
+	} else {
+		pte_t *pte = pte_offset_map(pmd, addr);
+		unsigned long _addr = addr;
+
+		while (1) {
+			pfn = (pte_val(*pte) & PTE_PFN_MASK) >> PAGE_SHIFT;
+			page = pfn_to_page(pfn);
+
+			if (!(_addr & (HPAGE_PMD_SIZE-1))) {
+				sp->num_seen_base_pages = 0;
+				sp->num_accessed_base_pages = 0;
+			}
+
+			sp->num_seen_base_pages++;
+			if (page->access_freq != 0)
+				sp->num_accessed_base_pages++;
+
+			if (sp->num_seen_base_pages == HPAGE_PMD_NR) {
+				unsigned long long idx = sp->num_accessed_base_pages_arr_idx++;
+				sp->num_accessed_base_pages_arr[idx] = sp->num_accessed_base_pages;
+				sp->num_seen_base_pages = 0;
+				sp->num_accessed_base_pages = 0;
+			}
+
+			_addr += PAGE_SIZE;
+			if (_addr == end)
+				break;
+			pte++;
+			touch_nmi_watchdog();
+		}
+	}
+
+	return 0;
+}
+
+static int count_accessed_base_pages(struct task_struct *task, void *arg)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		goto out;
+	down_read(&mm->mmap_sem);
+
+	vma = mm->mmap;
+	for (; vma != NULL; vma = vma->vm_next) {
+		struct mm_walk walk = {
+			.pmd_entry = count_accessed_base_pages_pmd_range,
+			.mm = mm,
+			.vma = vma,
+			.private = arg
+		};
+		walk_page_vma(vma, &walk);
+	}
+
+	up_read(&mm->mmap_sem);
+	mmput(mm);
+out:
+	return 0;
+}
+
+static int memcg_hotness_access_freq_accessed_base_page_read(struct seq_file *sf, void *v)
+{
+	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(sf));
+	struct access_freq_accessed_base_page_scratchpad *sp;
+	unsigned int i;
+
+	sp = vmalloc(sizeof(struct access_freq_accessed_base_page_scratchpad));
+	memset(sp, 0, sizeof(struct access_freq_accessed_base_page_scratchpad));
+	mem_cgroup_scan_tasks(memcg, count_accessed_base_pages, sp);
+
+	for (i = 0; i < sp->num_accessed_base_pages_arr_idx; i++) {
+		if (i == 0)
+			seq_printf(sf, "%llu", sp->num_accessed_base_pages_arr[i]);
+		else
+			seq_printf(sf, ",%llu", sp->num_accessed_base_pages_arr[i]);
+	}
+	seq_printf(sf, "\n");
+
+	vfree(sp);
+
+	return 0;
+}
 #endif /* CONFIG_PAGE_HOTNESS_PROFILING */
 
 static struct cftype mem_cgroup_legacy_files[] = {
@@ -4277,6 +4379,10 @@ static struct cftype mem_cgroup_legacy_files[] = {
 	{
 		.name = "hotness.access_freq.variance",
 		.seq_show = memcg_hotness_access_freq_variance_read,
+	},
+	{
+		.name = "hotness.access_freq.accessed_base_page",
+		.seq_show = memcg_hotness_access_freq_accessed_base_page_read,
 	},
 #endif
 	{ },	/* terminate */
